@@ -1,0 +1,66 @@
+# CLAUDE.md
+
+Guidance for working in the porty-aio repo.
+
+## What this is
+
+porty-aio is a compact, dependency-free, cross-platform port scanner. The whole
+identity is "one tiny static binary that just works anywhere", so every decision
+defends that promise. v1 is a TCP connect scanner; port-forwarding and pivot
+features come later (the "aio" part).
+
+## Core architecture
+
+- **Connect-scan only, on purpose.** TCP connect needs no raw sockets, no
+  libpcap/Npcap, no root. That constraint is what lets the binary be fully
+  static. Do not add scan modes that require raw sockets or native packet
+  libraries; they would break the core promise.
+- **Standard library only.** The scan engine (`internal/scan`) uses only the Go
+  stdlib (`net`, `context`, `sync`). Keep it that way. Adding a third-party
+  dependency needs a strong, explicit justification because dependency-free is
+  both a runtime and a supply-chain selling point.
+- **Static by default.** All builds are `CGO_ENABLED=0`. The output must stay
+  "statically linked" (verify with `file` / `ldd` showing "not a dynamic
+  executable"). Never introduce cgo.
+- **Go, chosen for cross-compilation.** `GOOS`/`GOARCH` with CGO off gives
+  static binaries for every target from one machine. This is a load-bearing
+  reason for the language choice, not incidental.
+
+## Layout
+
+```
+cmd/porty-aio/      CLI entry point (flags, parsing, output)
+internal/scan/      stdlib-only connect-scan engine, target/port parsers, TopPorts
+Dockerfile          pinned Go toolchain; single source of truth for the Go version
+scripts/
+  build.sh          host wrapper (Linux/macOS), drives Docker
+  build.ps1         host wrapper (Windows), drives Docker
+  build-matrix.sh   in-container cross-compile loop; the real build logic lives here
+```
+
+## Build
+
+Builds run in Docker so no local Go toolchain is required. To upgrade Go, bump
+the one `FROM` line in the `Dockerfile`. The host wrappers stay thin; shared
+build logic lives only in `build-matrix.sh` (do not duplicate the matrix across
+the `.sh` and `.ps1`).
+
+```sh
+./scripts/build.sh                       # full matrix
+TARGETS="linux/amd64" ./scripts/build.sh # narrow for quick checks
+```
+
+## Conventions
+
+- Binaries are UPX-compressed (`--best --lzma`) to minimize size. Packing is
+  skipped for darwin (macOS codesigning rejects packed binaries) and
+  windows/arm64 (not supported by UPX). Toggle with `UPX=0` for an uncompressed
+  build when debugging.
+- `-json` output is JSONL (one object per line) so it pipes into the later
+  forwarding/selection stage.
+- Prose and comments: plain punctuation. No em-dashes.
+
+## Commits
+
+- Do not add Claude/AI co-authorship trailers. Commit as the user only (no
+  `Co-Authored-By` line).

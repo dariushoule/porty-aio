@@ -1,0 +1,5 @@
+# The builder image carries only the toolchain; source is mounted at run time.
+# Keep the build context tiny.
+dist/
+.git/
+*.md

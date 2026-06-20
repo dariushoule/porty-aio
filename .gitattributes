@@ -1,0 +1,6 @@
+# Normalize line endings. The repo stores text as LF so shell scripts work
+# inside the Linux build container regardless of the contributor's OS.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.ps1 text eol=crlf
