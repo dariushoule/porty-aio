@@ -148,6 +148,39 @@ func incIP(ip net.IP) {
 	}
 }
 
+// ResolveTargets resolves any hostnames in the target list to IP addresses a
+// single time, so the scan dials IP literals and never re-resolves per port.
+// IP literals (including CIDR-expanded addresses) pass through unchanged, and
+// results are deduplicated while preserving order. Hostnames that fail to
+// resolve are returned in failed so the caller can report them without aborting
+// the scan.
+func ResolveTargets(ctx context.Context, hosts []string) (resolved, failed []string) {
+	var resolver net.Resolver
+	seen := make(map[string]bool)
+	add := func(ip string) {
+		if !seen[ip] {
+			seen[ip] = true
+			resolved = append(resolved, ip)
+		}
+	}
+
+	for _, h := range hosts {
+		if net.ParseIP(h) != nil {
+			add(h)
+			continue
+		}
+		addrs, err := resolver.LookupIP(ctx, "ip", h)
+		if err != nil || len(addrs) == 0 {
+			failed = append(failed, h)
+			continue
+		}
+		for _, a := range addrs {
+			add(a.String())
+		}
+	}
+	return resolved, failed
+}
+
 // ParsePorts expands a port specification into a deduplicated, ordered list.
 //
 // Accepted forms:

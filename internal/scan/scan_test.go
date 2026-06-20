@@ -211,6 +211,31 @@ func TestScanDetectsGoldenPortSet(t *testing.T) {
 	}
 }
 
+func TestResolveTargets(t *testing.T) {
+	ctx := context.Background()
+
+	// IP literals pass through unchanged and are deduplicated in order.
+	resolved, failed := ResolveTargets(ctx, []string{"127.0.0.1", "127.0.0.1", "10.0.0.1"})
+	if !reflect.DeepEqual(resolved, []string{"127.0.0.1", "10.0.0.1"}) {
+		t.Errorf("IP passthrough/dedup: got %v", resolved)
+	}
+	if len(failed) != 0 {
+		t.Errorf("no failures expected, got %v", failed)
+	}
+
+	// localhost resolves to a loopback address (no external network needed).
+	resolved, _ = ResolveTargets(ctx, []string{"localhost"})
+	if !containsStr(resolved, "127.0.0.1") && !containsStr(resolved, "::1") {
+		t.Errorf("localhost should resolve to a loopback address, got %v", resolved)
+	}
+
+	// The reserved .invalid TLD never resolves, so it lands in failed.
+	_, failed = ResolveTargets(ctx, []string{"this-name-does-not-exist.invalid"})
+	if len(failed) != 1 {
+		t.Errorf("expected 1 unresolved host, got %v", failed)
+	}
+}
+
 func acceptAndClose(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -222,6 +247,15 @@ func acceptAndClose(ln net.Listener) {
 }
 
 func contains(xs []int, x int) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStr(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
 			return true

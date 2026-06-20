@@ -50,7 +50,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	hosts, err := scan.ParseTargets(flag.Arg(0))
+	targets, err := scan.ParseTargets(flag.Arg(0))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -63,6 +63,17 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+
+	// Resolve hostnames to IPs once up front so the scan never re-resolves per
+	// port. Hosts that do not resolve are reported but do not abort the scan.
+	hosts, failed := scan.ResolveTargets(ctx, targets)
+	for _, h := range failed {
+		fmt.Fprintf(os.Stderr, "warning: could not resolve %q, skipping\n", h)
+	}
+	if len(hosts) == 0 {
+		fmt.Fprintln(os.Stderr, "error: no targets could be resolved")
+		os.Exit(1)
+	}
 
 	enc := json.NewEncoder(os.Stdout)
 	start := time.Now()
