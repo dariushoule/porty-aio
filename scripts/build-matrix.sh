@@ -60,5 +60,9 @@ for t in $TARGETS; do
 done
 
 echo
+echo "generating SHA256SUMS.txt..."
+( cd "$OUT" && sha256sum porty-aio_* > SHA256SUMS.txt )
+
+echo
 echo "done. artifacts in ./${OUT}:"
 ls -lh "$OUT"
