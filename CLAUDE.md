@@ -4,10 +4,10 @@ Guidance for working in the porty-aio repo.
 
 ## What this is
 
-porty-aio is a compact, dependency-free, cross-platform port scanner. The whole
+porty-aio is a compact, dependency-free, cross-platform network tool. The whole
 identity is "one tiny static binary that just works anywhere", so every decision
-defends that promise. v1 is a TCP connect scanner; port-forwarding and pivot
-features come later (the "aio" part).
+defends that promise. Its core is a TCP connect scanner; it also has a single-box
+TCP port forwarder (the "aio" part). Both are standard library only.
 
 ## Core architecture
 
@@ -15,10 +15,15 @@ features come later (the "aio" part).
   libpcap/Npcap, no root. That constraint is what lets the binary be fully
   static. Do not add scan modes that require raw sockets or native packet
   libraries; they would break the core promise.
-- **Standard library only.** The scan engine (`internal/scan`) uses only the Go
-  stdlib (`net`, `context`, `sync`). Keep it that way. Adding a third-party
-  dependency needs a strong, explicit justification because dependency-free is
-  both a runtime and a supply-chain selling point.
+- **Standard library only.** The scan engine (`internal/scan`) and forwarder
+  (`internal/forward`) use only the Go stdlib (`net`, `context`, `sync`, `io`).
+  Keep it that way. Adding a third-party dependency needs a strong, explicit
+  justification because dependency-free is both a runtime and a supply-chain
+  selling point.
+- **Forwarding is a single-box relay, not a tunnel.** porty runs on one host,
+  listens, and relays to a destination (loopback service or another reachable
+  machine). No second instance, no multiplexing, no SSH-style local/reverse
+  modes. The CLI is `forward --listen <addr> --to <host:port>`, repeatable.
 - **Static by default.** All builds are `CGO_ENABLED=0`. The output must stay
   "statically linked" (verify with `file` / `ldd` showing "not a dynamic
   executable"). Never introduce cgo.
@@ -29,9 +34,10 @@ features come later (the "aio" part).
 ## Layout
 
 ```
-cmd/porty-aio/      CLI entry point (flags, parsing, output)
+cmd/porty-aio/      CLI entry point; "forward" subcommand, else scan (flags, output)
 internal/scan/      stdlib-only connect-scan engine, target/port parsers, TopPorts
   scan_test.go      unit tests (parsing) + integration test (real loopback scan)
+internal/forward/   stdlib-only TCP port forwarder (Listen + Serve relay)
 Dockerfile          pinned Go toolchain; single source of truth for the Go version
 scripts/
   build.sh          host wrapper (Linux/macOS), drives Docker
@@ -68,8 +74,8 @@ network.
   skipped for darwin (macOS codesigning rejects packed binaries) and
   windows/arm64 (not supported by UPX). Toggle with `UPX=0` for an uncompressed
   build when debugging.
-- `-json` output is JSONL (one object per line) so it pipes into the later
-  forwarding/selection stage.
+- `-json` output is JSONL (one object per line) so it pipes cleanly into other
+  tools.
 - Prose and comments: plain punctuation. No em-dashes.
 
 ## Commits

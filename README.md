@@ -1,12 +1,11 @@
 # porty-aio
 
-A compact, dependency-free, cross-platform port scanner that just works anywhere.
+A compact, dependency-free, cross-platform network tool that just works anywhere.
 
-One static binary. No libpcap, no Npcap, no glibc pinning, no root. It does TCP
-connect scanning, which needs no raw sockets or packet-capture libraries, so a
-single `go build` produces a binary you can drop on any Linux, Windows, or macOS
-host and run. Port-forwarding and pivot features are planned for later versions
-(the "aio" part).
+One static binary. No libpcap, no Npcap, no glibc pinning, no root. Its core is a
+TCP connect scanner, which needs no raw sockets or packet-capture libraries, plus
+a simple single-box TCP port forwarder. A single `go build` produces a binary you
+can drop on any Linux, Windows, or macOS host and run.
 
 ## Why connect-only
 
@@ -95,14 +94,40 @@ porty-aio -p 1-65535 -c 1024 192.168.1.10
 porty-aio -p 22,80,443 -json 10.0.0.0/24 > open.jsonl
 ```
 
+## Forward
+
+Run porty on a box and relay a local listener to a destination, which may be a
+loopback-only service on the same host or another machine the box can reach.
+There is no tunnel and no second instance.
+
+```
+porty-aio forward --listen <addr> --to <host:port> [--listen ... --to ...]
+```
+
+```sh
+# expose another machine's service on this box
+porty-aio forward --listen :8080 --to 10.0.0.5:80
+
+# expose a loopback-only service to the network
+porty-aio forward --listen :3306 --to 127.0.0.1:3306
+
+# multiple forwards at once
+porty-aio forward --listen :8080 --to 10.0.0.5:80 --listen :2222 --to 10.0.0.9:22
+```
+
+`--listen` binds all interfaces when the host is omitted (`:8080`); give a host
+to bind one interface (`127.0.0.1:8080`). TCP only.
+
 ## Layout
 
 ```
-cmd/porty-aio/      CLI entry point
+cmd/porty-aio/      CLI entry point (scan + forward subcommands)
 internal/scan/      stdlib-only connect-scan engine
+internal/forward/   stdlib-only TCP port forwarder
 Dockerfile          pinned Go toolchain (single source of truth for the version)
 scripts/
-  build.sh          host wrapper (Linux/macOS)
-  build.ps1         host wrapper (Windows)
-  build-matrix.sh   in-container cross-compile loop (the real build logic)
+  build.sh            host wrapper (Linux/macOS)
+  build.ps1           host wrapper (Windows)
+  build-matrix.sh     in-container cross-compile loop (the real build logic)
+  test.sh / test.ps1  run the test suite in the build container
 ```
