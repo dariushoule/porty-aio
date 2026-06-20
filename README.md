@@ -64,9 +64,10 @@ Tests run in the same build container, so no local Go toolchain is needed:
 .\scripts\test.ps1
 ```
 
-This covers unit tests for port/target/CIDR parsing plus an integration test that
-stands up real loopback listeners and asserts the scanner reports exactly the
-open port set.
+This covers the scan engine (port/target/CIDR parsing, plus an integration test
+that stands up real loopback listeners and checks the exact open set), the port
+forwarder (end-to-end relay through a loopback backend), and the CLI (subcommand
+dispatch and text/JSON output modes).
 
 ## Usage
 
