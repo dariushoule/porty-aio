@@ -76,3 +76,18 @@ network.
 
 - Do not add Claude/AI co-authorship trailers. Commit as the user only (no
   `Co-Authored-By` line).
+
+## Branching and releases
+
+- New features go through a branch and a pull request into `main`, not direct
+  commits. This is what powers the auto-generated release notes: each merged PR
+  becomes a changelog entry, grouped by label (see `.github/release.yml`). Label
+  PRs with `feature`/`enhancement`, `bug`/`fix`, or `documentation` so they land
+  in the right section.
+- Foundational infra (CI config, build scripts) may go straight to `main`.
+- CI (`.github/workflows/ci.yml`) runs gofmt, vet, and tests on every push and
+  PR to `main`.
+- To cut a release, push a `vMAJOR.MINOR.PATCH` tag. `release.yml` builds the
+  full static + UPX matrix via `scripts/build.sh`, attaches the binaries and
+  `SHA256SUMS.txt`, and creates the GitHub Release with generated notes. Stay on
+  `v0.x` (breaking changes allowed in minor) until the API stabilizes.
