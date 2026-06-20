@@ -43,8 +43,10 @@ for t in $TARGETS; do
 	[ "$GOOS" = "windows" ] && name="${name}.exe"
 
 	echo ">> ${GOOS}/${GOARCH} -> ${OUT}/${name}"
+	# -buildvcs=false: the version is stamped via -ldflags below, and VCS
+	# stamping fails when building in a container against a host-owned .git.
 	CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" GOARM=7 \
-		go build -trimpath \
+		go build -trimpath -buildvcs=false \
 		-ldflags "-s -w -X main.version=${VERSION}" \
 		-o "${OUT}/${name}" "$PKG"
 
