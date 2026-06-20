@@ -9,6 +9,7 @@ package scan
 import (
 	"context"
 	"fmt"
+	"iter"
 	"net"
 	"strconv"
 	"strings"
@@ -31,10 +32,11 @@ type Options struct {
 }
 
 // Scan dials every host/port combination over TCP and invokes onOpen for each
-// port that accepts a connection. onOpen is called serially, so it does not
-// need to be safe for concurrent use. Scan blocks until every probe completes
-// or ctx is cancelled.
-func Scan(ctx context.Context, hosts []string, ports []int, opts Options, onOpen func(Result)) {
+// port that accepts a connection. Hosts are pulled lazily from the hosts
+// iterator, so callers can stream very large target sets without materializing
+// them. onOpen is called serially, so it does not need to be safe for
+// concurrent use. Scan blocks until every probe completes or ctx is cancelled.
+func Scan(ctx context.Context, hosts iter.Seq[string], ports []int, opts Options, onOpen func(Result)) {
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = 512
 	}
@@ -72,7 +74,7 @@ func Scan(ctx context.Context, hosts []string, ports []int, opts Options, onOpen
 	}
 
 feed:
-	for _, h := range hosts {
+	for h := range hosts {
 		for _, p := range ports {
 			select {
 			case <-ctx.Done():
@@ -85,24 +87,49 @@ feed:
 	wg.Wait()
 }
 
-// ParseTargets expands a comma-separated list of hosts, IPv4/IPv6 addresses,
-// and CIDR ranges into individual target strings.
-func ParseTargets(spec string) ([]string, error) {
-	var out []string
+// Target is a parsed scan target: a single IP, a CIDR range, or a hostname.
+// CIDR ranges and hostnames are expanded lazily by StreamHosts so large target
+// sets are never materialized.
+type Target struct {
+	raw  string
+	ip   net.IP
+	cidr *net.IPNet
+	host string
+}
+
+// maxCIDRHostBits bounds how large a single CIDR range may be. With streaming
+// this is no longer a memory limit; it is a footgun guard, primarily against
+// accidentally enumerating an IPv6 range (a /64 is 2^64 addresses). 24 host
+// bits allows an IPv4 /8 (~16M addresses); raise it if you really need wider.
+const maxCIDRHostBits = 24
+
+// ParseTargets parses a comma-separated list of hosts, IPv4/IPv6 addresses, and
+// CIDR ranges into Targets. It validates syntax and rejects CIDR ranges larger
+// than maxCIDRHostBits, but does not expand ranges or resolve hostnames; that
+// happens lazily in StreamHosts.
+func ParseTargets(spec string) ([]Target, error) {
+	var out []Target
 	for _, part := range strings.Split(spec, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 		if strings.Contains(part, "/") {
-			ips, err := expandCIDR(part)
+			_, ipnet, err := net.ParseCIDR(part)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ips...)
+			if ones, bits := ipnet.Mask.Size(); bits-ones > maxCIDRHostBits {
+				return nil, fmt.Errorf("CIDR %s is too large (2^%d addresses); narrow the range", part, bits-ones)
+			}
+			out = append(out, Target{raw: part, cidr: ipnet})
 			continue
 		}
-		out = append(out, part)
+		if ip := net.ParseIP(part); ip != nil {
+			out = append(out, Target{raw: part, ip: ip})
+			continue
+		}
+		out = append(out, Target{raw: part, host: part})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no targets parsed from %q", spec)
@@ -110,33 +137,85 @@ func ParseTargets(spec string) ([]string, error) {
 	return out, nil
 }
 
-// maxCIDRHostBits caps CIDR expansion at ~1M addresses (e.g. IPv4 /12). v1
-// materializes every address up front, so this guards against accidentally
-// expanding an IPv6 /64 or a huge IPv4 range and exhausting memory.
-const maxCIDRHostBits = 20
+// StreamHosts lazily yields the IP addresses to scan for the given targets: IP
+// literals as-is, CIDR ranges expanded address by address, and hostnames
+// resolved (once each) to their IPs. Ranges and hostnames are produced lazily,
+// so a large CIDR is never materialized. Explicit IPs and resolved hostname
+// addresses are deduplicated; CIDR addresses are streamed without a global dedup
+// set (a single range never repeats an address), so overlapping ranges may be
+// scanned more than once. Hostnames that fail to resolve are passed to
+// onUnresolved (which may be nil) and skipped.
+func StreamHosts(ctx context.Context, targets []Target, onUnresolved func(string)) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		var resolver net.Resolver
+		seen := make(map[string]bool)
+		emit := func(ip string) bool {
+			if seen[ip] {
+				return true
+			}
+			seen[ip] = true
+			return yield(ip)
+		}
 
-func expandCIDR(cidr string) ([]string, error) {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, err
+		for _, t := range targets {
+			switch {
+			case t.ip != nil:
+				if !emit(t.ip.String()) {
+					return
+				}
+			case t.cidr != nil:
+				if !eachCIDRHost(t.cidr, yield) {
+					return
+				}
+			default:
+				addrs, err := resolver.LookupIP(ctx, "ip", t.host)
+				if err != nil || len(addrs) == 0 {
+					if onUnresolved != nil {
+						onUnresolved(t.host)
+					}
+					continue
+				}
+				for _, a := range addrs {
+					if !emit(a.String()) {
+						return
+					}
+				}
+			}
+		}
 	}
+}
+
+// eachCIDRHost calls yield for each scannable address in the range. For ranges
+// wider than a /31 it skips the network and broadcast addresses. It returns
+// false if yield asked to stop.
+func eachCIDRHost(ipnet *net.IPNet, yield func(string) bool) bool {
 	ones, bits := ipnet.Mask.Size()
-	if hostBits := bits - ones; hostBits > maxCIDRHostBits {
-		return nil, fmt.Errorf("CIDR %s is too large to expand (2^%d addresses); narrow the range", cidr, hostBits)
-	}
+	skipEnds := bits-ones >= 2
 
-	ip := make(net.IP, len(ipnet.IP))
-	copy(ip, ipnet.IP)
+	network := ipnet.IP.Mask(ipnet.Mask)
+	broadcast := lastAddr(ipnet)
 
-	var ips []string
-	for ; ipnet.Contains(ip); incIP(ip) {
-		ips = append(ips, ip.String())
+	ip := make(net.IP, len(network))
+	copy(ip, network)
+	for ipnet.Contains(ip) {
+		if !(skipEnds && (ip.Equal(network) || ip.Equal(broadcast))) {
+			if !yield(ip.String()) {
+				return false
+			}
+		}
+		incIP(ip)
 	}
-	// Drop network and broadcast addresses for anything wider than a /31.
-	if bits-ones >= 2 && len(ips) > 2 {
-		ips = ips[1 : len(ips)-1]
+	return true
+}
+
+// lastAddr returns the highest address in the range (all host bits set).
+func lastAddr(ipnet *net.IPNet) net.IP {
+	network := ipnet.IP.Mask(ipnet.Mask)
+	out := make(net.IP, len(network))
+	for i := range network {
+		out[i] = network[i] | ^ipnet.Mask[i]
 	}
-	return ips, nil
+	return out
 }
 
 func incIP(ip net.IP) {
@@ -146,39 +225,6 @@ func incIP(ip net.IP) {
 			break
 		}
 	}
-}
-
-// ResolveTargets resolves any hostnames in the target list to IP addresses a
-// single time, so the scan dials IP literals and never re-resolves per port.
-// IP literals (including CIDR-expanded addresses) pass through unchanged, and
-// results are deduplicated while preserving order. Hostnames that fail to
-// resolve are returned in failed so the caller can report them without aborting
-// the scan.
-func ResolveTargets(ctx context.Context, hosts []string) (resolved, failed []string) {
-	var resolver net.Resolver
-	seen := make(map[string]bool)
-	add := func(ip string) {
-		if !seen[ip] {
-			seen[ip] = true
-			resolved = append(resolved, ip)
-		}
-	}
-
-	for _, h := range hosts {
-		if net.ParseIP(h) != nil {
-			add(h)
-			continue
-		}
-		addrs, err := resolver.LookupIP(ctx, "ip", h)
-		if err != nil || len(addrs) == 0 {
-			failed = append(failed, h)
-			continue
-		}
-		for _, a := range addrs {
-			add(a.String())
-		}
-	}
-	return resolved, failed
 }
 
 // ParsePorts expands a port specification into a deduplicated, ordered list.
