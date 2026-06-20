@@ -18,7 +18,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          # No third-party dependencies (stdlib only), so there is nothing to
+          # cache and no go.sum for the cache key.
+          cache: false
 
       - name: Check formatting
         run: |
