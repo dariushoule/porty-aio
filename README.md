@@ -53,6 +53,22 @@ docker run --rm -v "$PWD/dist":/d alpine sh -c 'apk add -q file && file /d/porty
 # => ... statically linked ...
 ```
 
+## Test
+
+Tests run in the same build container, so no local Go toolchain is needed:
+
+```sh
+# Linux / macOS
+./scripts/test.sh
+
+# Windows
+.\scripts\test.ps1
+```
+
+This covers unit tests for port/target/CIDR parsing plus an integration test that
+stands up real loopback listeners and asserts the scanner reports exactly the
+open port set.
+
 ## Usage
 
 ```

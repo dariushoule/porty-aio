@@ -31,11 +31,14 @@ features come later (the "aio" part).
 ```
 cmd/porty-aio/      CLI entry point (flags, parsing, output)
 internal/scan/      stdlib-only connect-scan engine, target/port parsers, TopPorts
+  scan_test.go      unit tests (parsing) + integration test (real loopback scan)
 Dockerfile          pinned Go toolchain; single source of truth for the Go version
 scripts/
   build.sh          host wrapper (Linux/macOS), drives Docker
   build.ps1         host wrapper (Windows), drives Docker
   build-matrix.sh   in-container cross-compile loop; the real build logic lives here
+  test.sh           host wrapper (Linux/macOS) to run the test suite in the container
+  test.ps1          host wrapper (Windows) to run the test suite in the container
 ```
 
 ## Build
@@ -49,6 +52,15 @@ the `.sh` and `.ps1`).
 ./scripts/build.sh                       # full matrix
 TARGETS="linux/amd64" ./scripts/build.sh # narrow for quick checks
 ```
+
+## Tests
+
+Run the suite with `./scripts/test.sh` (or `.\scripts\test.ps1`), which runs
+`go test ./...` in the build container. The scan engine has table-driven unit
+tests for parsing plus an integration test that opens real loopback listeners
+and asserts the scanner reports exactly the expected open port set. Keep them
+green, and prefer hermetic loopback-based tests over anything needing the
+network.
 
 ## Conventions
 
