@@ -2,6 +2,7 @@ package scan
 
 import (
 	"context"
+	"iter"
 	"net"
 	"reflect"
 	"sort"
@@ -97,69 +98,85 @@ func TestTopPortsGolden(t *testing.T) {
 	}
 }
 
-func TestParseTargets(t *testing.T) {
+// TestStreamHosts parses targets and collects the lazily-streamed host list,
+// covering IP passthrough, dedup, CIDR network/broadcast trimming, and order.
+func TestStreamHosts(t *testing.T) {
+	ctx := context.Background()
 	tests := []struct {
 		name string
 		spec string
 		want []string
 	}{
 		{"single ip", "10.0.0.1", []string{"10.0.0.1"}},
-		{"hostname", "host.lan", []string{"host.lan"}},
 		{"comma list", "10.0.0.1,10.0.0.2", []string{"10.0.0.1", "10.0.0.2"}},
+		{"dedup explicit ips", "10.0.0.1,10.0.0.1", []string{"10.0.0.1"}},
 		{"cidr /30 drops net+bcast", "192.168.0.0/30", []string{"192.168.0.1", "192.168.0.2"}},
-		{"cidr /32", "192.168.0.5/32", []string{"192.168.0.5"}},
 		{"cidr /31 keeps both", "192.168.0.0/31", []string{"192.168.0.0", "192.168.0.1"}},
+		{"cidr /32", "192.168.0.5/32", []string{"192.168.0.5"}},
 		{"mixed host and cidr", "1.1.1.1,192.168.0.0/30", []string{"1.1.1.1", "192.168.0.1", "192.168.0.2"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseTargets(tc.spec)
-			if err != nil {
-				t.Fatalf("ParseTargets(%q) error: %v", tc.spec, err)
-			}
+			got := collect(StreamHosts(ctx, mustTargets(t, tc.spec), nil))
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("ParseTargets(%q) = %v, want %v", tc.spec, got, tc.want)
+				t.Errorf("StreamHosts(%q) = %v, want %v", tc.spec, got, tc.want)
 			}
 		})
 	}
 }
 
+// TestStreamHostsCIDRCounts checks lazy CIDR expansion yields the right number
+// of addresses, including a larger range and IPv6.
+func TestStreamHostsCIDRCounts(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		cidr  string
+		count int
+	}{
+		{"192.168.1.0/24", 254},
+		{"10.0.0.0/20", 4094},
+		{"fe80::/126", 2},
+	}
+	for _, tc := range tests {
+		got := len(collect(StreamHosts(ctx, mustTargets(t, tc.cidr), nil)))
+		if got != tc.count {
+			t.Errorf("%s yielded %d addresses, want %d", tc.cidr, got, tc.count)
+		}
+	}
+}
+
+func TestStreamHostsResolution(t *testing.T) {
+	ctx := context.Background()
+
+	// localhost resolves to a loopback address (no external network needed).
+	got := collect(StreamHosts(ctx, mustTargets(t, "localhost"), nil))
+	if !containsStr(got, "127.0.0.1") && !containsStr(got, "::1") {
+		t.Errorf("localhost should resolve to a loopback address, got %v", got)
+	}
+
+	// The reserved .invalid TLD never resolves: yields nothing, fires onUnresolved.
+	var failed string
+	got = collect(StreamHosts(ctx, mustTargets(t, "nope.invalid"), func(h string) { failed = h }))
+	if len(got) != 0 {
+		t.Errorf("unresolvable host should yield nothing, got %v", got)
+	}
+	if failed != "nope.invalid" {
+		t.Errorf("onUnresolved should fire with the hostname, got %q", failed)
+	}
+}
+
 func TestParseTargetsErrors(t *testing.T) {
-	for _, spec := range []string{"", " , ", "10.0.0.0/8", "bad/33"} {
+	for _, spec := range []string{"", " , ", "bad/33", "10.0.0.0/7", "2001:db8::/64"} {
 		if _, err := ParseTargets(spec); err == nil {
 			t.Errorf("ParseTargets(%q) expected error, got nil", spec)
 		}
 	}
 }
 
-func TestExpandCIDR(t *testing.T) {
-	tests := []struct {
-		cidr  string
-		count int
-	}{
-		{"192.168.1.0/24", 254},
-		{"192.168.1.0/30", 2},
-		{"192.168.1.0/31", 2},
-		{"192.168.1.7/32", 1},
-		{"10.0.0.0/20", 4094},
-		{"fe80::/126", 2},
-	}
-	for _, tc := range tests {
-		got, err := expandCIDR(tc.cidr)
-		if err != nil {
-			t.Fatalf("expandCIDR(%q) error: %v", tc.cidr, err)
-		}
-		if len(got) != tc.count {
-			t.Errorf("expandCIDR(%q) returned %d addresses, want %d", tc.cidr, len(got), tc.count)
-		}
-	}
-}
-
-func TestExpandCIDRGuard(t *testing.T) {
-	for _, cidr := range []string{"10.0.0.0/8", "0.0.0.0/0", "172.16.0.0/11", "2001:db8::/64"} {
-		if _, err := expandCIDR(cidr); err == nil {
-			t.Errorf("expandCIDR(%q) expected too-large error, got nil", cidr)
-		}
+func TestParseTargetsAllowsLargeIPv4(t *testing.T) {
+	// Streaming lifts the old memory cap: an IPv4 /8 is allowed (it just streams).
+	if _, err := ParseTargets("10.0.0.0/8"); err != nil {
+		t.Errorf("ParseTargets(10.0.0.0/8) should be allowed: %v", err)
 	}
 }
 
@@ -192,7 +209,7 @@ func TestScanDetectsGoldenPortSet(t *testing.T) {
 
 	var mu sync.Mutex
 	var found []int
-	Scan(context.Background(), []string{"127.0.0.1"}, ports, Options{
+	Scan(context.Background(), seqOf("127.0.0.1"), ports, Options{
 		Concurrency: 16,
 		Timeout:     2 * time.Second,
 	}, func(r Result) {
@@ -211,28 +228,30 @@ func TestScanDetectsGoldenPortSet(t *testing.T) {
 	}
 }
 
-func TestResolveTargets(t *testing.T) {
-	ctx := context.Background()
-
-	// IP literals pass through unchanged and are deduplicated in order.
-	resolved, failed := ResolveTargets(ctx, []string{"127.0.0.1", "127.0.0.1", "10.0.0.1"})
-	if !reflect.DeepEqual(resolved, []string{"127.0.0.1", "10.0.0.1"}) {
-		t.Errorf("IP passthrough/dedup: got %v", resolved)
+func mustTargets(t *testing.T, spec string) []Target {
+	t.Helper()
+	targets, err := ParseTargets(spec)
+	if err != nil {
+		t.Fatalf("ParseTargets(%q): %v", spec, err)
 	}
-	if len(failed) != 0 {
-		t.Errorf("no failures expected, got %v", failed)
-	}
+	return targets
+}
 
-	// localhost resolves to a loopback address (no external network needed).
-	resolved, _ = ResolveTargets(ctx, []string{"localhost"})
-	if !containsStr(resolved, "127.0.0.1") && !containsStr(resolved, "::1") {
-		t.Errorf("localhost should resolve to a loopback address, got %v", resolved)
+func collect(seq iter.Seq[string]) []string {
+	var out []string
+	for s := range seq {
+		out = append(out, s)
 	}
+	return out
+}
 
-	// The reserved .invalid TLD never resolves, so it lands in failed.
-	_, failed = ResolveTargets(ctx, []string{"this-name-does-not-exist.invalid"})
-	if len(failed) != 1 {
-		t.Errorf("expected 1 unresolved host, got %v", failed)
+func seqOf(items ...string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for _, it := range items {
+			if !yield(it) {
+				return
+			}
+		}
 	}
 }
 

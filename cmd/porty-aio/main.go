@@ -64,15 +64,20 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Resolve hostnames to IPs once up front so the scan never re-resolves per
-	// port. Hosts that do not resolve are reported but do not abort the scan.
-	hosts, failed := scan.ResolveTargets(ctx, targets)
-	for _, h := range failed {
-		fmt.Fprintf(os.Stderr, "warning: could not resolve %q, skipping\n", h)
+	// Stream hosts lazily: hostnames resolve once, CIDR ranges expand address by
+	// address, so very large ranges are never materialized. Unresolvable
+	// hostnames are reported but do not abort the scan.
+	onUnresolved := func(name string) {
+		fmt.Fprintf(os.Stderr, "warning: could not resolve %q, skipping\n", name)
 	}
-	if len(hosts) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no targets could be resolved")
-		os.Exit(1)
+	var hostCount int
+	hosts := func(yield func(string) bool) {
+		for h := range scan.StreamHosts(ctx, targets, onUnresolved) {
+			hostCount++
+			if !yield(h) {
+				return
+			}
+		}
 	}
 
 	enc := json.NewEncoder(os.Stdout)
@@ -92,5 +97,8 @@ func main() {
 	})
 
 	fmt.Fprintf(os.Stderr, "done: %d open across %d host(s) x %d port(s) in %s\n",
-		open, len(hosts), len(ports), time.Since(start).Round(time.Millisecond))
+		open, hostCount, len(ports), time.Since(start).Round(time.Millisecond))
+	if hostCount == 0 {
+		os.Exit(1)
+	}
 }
