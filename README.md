@@ -56,6 +56,12 @@ porty-aio forward --listen :8080 --to 10.0.0.5:80 --listen :2222 --to 10.0.0.9:2
 `--listen` binds all interfaces when the host is omitted (`:8080`); give a host
 to bind one interface (`127.0.0.1:8080`). TCP only.
 
+The relay bounds its own resources so an exposed listener is not trivially
+exhausted: concurrent relays are capped, a relay idle in both directions is
+reclaimed after a timeout, a transient accept error (such as a momentary
+file-descriptor shortage) does not permanently kill the listener, and Ctrl-C
+drains in-flight relays before exit.
+
 ## Build (Dockerized, no local Go toolchain needed)
 
 You only need Docker. The Go version is pinned in the `Dockerfile`. Bump that one

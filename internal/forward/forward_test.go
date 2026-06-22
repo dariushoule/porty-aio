@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -200,5 +201,254 @@ func TestForwardReportsDest(t *testing.T) {
 func TestListenErrorIsClean(t *testing.T) {
 	if _, err := Listen([]Rule{{Listen: "127.0.0.1:99999", Dest: "x:1"}}); err == nil {
 		t.Error("expected an error for an out-of-range bind port")
+	}
+}
+
+// holdBackend stands up a loopback backend that accepts connections and holds
+// them open without ever sending, draining whatever the client writes. It is
+// used to exercise the relay lifecycle (idle reclaim, capacity, drain) without a
+// peer that closes first. The returned listener is closed via t.Cleanup.
+func holdBackend(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				io.Copy(io.Discard, c)
+				c.Close()
+			}(c)
+		}
+	}()
+	return ln
+}
+
+// TestForwardIdleTimeoutReclaims confirms a relay whose peers go silent in both
+// directions is reclaimed after the idle timeout instead of leaking forever
+// (the slowloris-style hold-open guard).
+func TestForwardIdleTimeoutReclaims(t *testing.T) {
+	backend := holdBackend(t)
+
+	ls, err := Listen([]Rule{{Listen: "127.0.0.1:0", Dest: backend.Addr().String()}})
+	if err != nil {
+		t.Fatalf("forward listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const idle = 300 * time.Millisecond
+	go serve(ctx, ls, options{idleTimeout: idle}, nil)
+
+	conn, err := net.Dial("tcp", ls[0].Addr().String())
+	if err != nil {
+		t.Fatalf("dial forward: %v", err)
+	}
+	defer conn.Close()
+
+	// Send nothing. The relay should be reclaimed for idleness, which the forward
+	// signals by closing our connection, so the read returns rather than blocking.
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	_, rerr := conn.Read(make([]byte, 1))
+	elapsed := time.Since(start)
+
+	if rerr == nil {
+		t.Fatal("expected the idle relay to close our connection, but read returned data")
+	}
+	if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("relay not reclaimed within 3s (idle timeout %s); our read deadline fired", idle)
+	}
+	if elapsed < idle/2 {
+		t.Errorf("relay closed after %s, sooner than the idle timeout %s should allow", elapsed, idle)
+	}
+	t.Logf("idle relay reclaimed after %s (idleTimeout=%s)", elapsed.Round(time.Millisecond), idle)
+}
+
+// TestForwardConnectionCapBounded confirms the relay semaphore caps how many
+// relays run at once, so a burst of inbound connections cannot grow unbounded.
+func TestForwardConnectionCapBounded(t *testing.T) {
+	const maxConns = 2
+	const clients = 5
+
+	var active, peak int32
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			c, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				cur := atomic.AddInt32(&active, 1)
+				for {
+					old := atomic.LoadInt32(&peak)
+					if cur <= old || atomic.CompareAndSwapInt32(&peak, old, cur) {
+						break
+					}
+				}
+				io.Copy(io.Discard, c) // hold until the client closes
+				atomic.AddInt32(&active, -1)
+				c.Close()
+			}(c)
+		}
+	}()
+
+	ls, err := Listen([]Rule{{Listen: "127.0.0.1:0", Dest: backend.Addr().String()}})
+	if err != nil {
+		t.Fatalf("forward listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Long idle timeout so no relay is reclaimed mid-test; small connection cap.
+	go serve(ctx, ls, options{maxConns: maxConns, idleTimeout: 30 * time.Second}, nil)
+
+	var conns []net.Conn
+	for i := 0; i < clients; i++ {
+		c, err := net.Dial("tcp", ls[0].Addr().String())
+		if err != nil {
+			t.Fatalf("dial forward %d: %v", i, err)
+		}
+		c.Write([]byte{'x'}) // establish the relay so the backend handler runs
+		conns = append(conns, c)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	// Wait for the cap to fill, then settle and assert it was never exceeded.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && atomic.LoadInt32(&active) < maxConns {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond) // let any over-cap relay surface if the cap failed
+
+	if got := atomic.LoadInt32(&peak); got != maxConns {
+		t.Errorf("backend saw a peak of %d concurrent relays, want exactly the cap %d", got, maxConns)
+	}
+}
+
+// flakyListener wraps a net.Listener and returns a transient (non-ErrClosed)
+// error on the first failsLeft Accept calls, to prove the accept loop recovers
+// from a transient error (such as EMFILE) instead of dying permanently.
+type flakyListener struct {
+	net.Listener
+	failsLeft atomic.Int32
+}
+
+func (f *flakyListener) Accept() (net.Conn, error) {
+	if f.failsLeft.Add(-1) >= 0 {
+		return nil, transientErr{}
+	}
+	return f.Listener.Accept()
+}
+
+type transientErr struct{}
+
+func (transientErr) Error() string   { return "transient accept failure" }
+func (transientErr) Timeout() bool   { return true }
+func (transientErr) Temporary() bool { return true }
+
+// TestForwardAcceptLoopSurvivesTransientError confirms a transient Accept error
+// is logged and retried rather than permanently killing the listener.
+func TestForwardAcceptLoopSurvivesTransientError(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			c, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { io.Copy(c, c); c.Close() }(c) // echo
+		}
+	}()
+
+	real, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	flaky := &flakyListener{Listener: real}
+	flaky.failsLeft.Store(1) // fail the first Accept once, then recover
+	l := &Listener{ln: flaky, dest: backend.Addr().String()}
+
+	var mu sync.Mutex
+	var gotLog string
+	logf := func(format string, a ...any) {
+		mu.Lock()
+		gotLog += fmt.Sprintf(format, a...) + "\n"
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go serve(ctx, []*Listener{l}, options{acceptBackoff: 10 * time.Millisecond}, logf)
+
+	// The first Accept failed transiently; the loop should back off and recover,
+	// so a real connection still gets relayed end to end.
+	if got := roundtrip(t, real.Addr().String(), "after-transient"); got != "after-transient" {
+		t.Errorf("relay after transient accept error = %q, want %q", got, "after-transient")
+	}
+
+	mu.Lock()
+	logged := gotLog
+	mu.Unlock()
+	if !strings.Contains(logged, "accept") {
+		t.Errorf("expected the transient accept error to be logged, got %q", logged)
+	}
+}
+
+// TestForwardShutdownDrainsActiveRelay confirms cancellation tears down an
+// in-flight relay and Serve returns promptly rather than hanging on it.
+func TestForwardShutdownDrainsActiveRelay(t *testing.T) {
+	backend := holdBackend(t)
+
+	ls, err := Listen([]Rule{{Listen: "127.0.0.1:0", Dest: backend.Addr().String()}})
+	if err != nil {
+		t.Fatalf("forward listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan struct{})
+	go func() {
+		serve(ctx, ls, options{idleTimeout: 30 * time.Second}, nil)
+		close(served)
+	}()
+
+	conn, err := net.Dial("tcp", ls[0].Addr().String())
+	if err != nil {
+		t.Fatalf("dial forward: %v", err)
+	}
+	defer conn.Close()
+	conn.Write([]byte("active")) // establish an active relay
+
+	time.Sleep(100 * time.Millisecond) // let the relay establish
+	cancel()                           // shut down
+
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return within 3s of cancellation; relays were not drained")
+	}
+
+	// The active relay's connection should have been closed by the shutdown.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("expected our connection to be closed on shutdown")
 	}
 }
