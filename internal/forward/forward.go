@@ -7,10 +7,10 @@
 // instance: porty runs on one box and forwards from there.
 //
 // Serve bounds its own resource use so an exposed listener is not trivially
-// exhausted: the number of concurrent relays is capped, relays idle in both
-// directions are reclaimed after a timeout, a transient Accept error does not
-// permanently kill a listener, and a cancelled context tears down in-flight
-// relays before Serve returns.
+// exhausted: the number of concurrent relays is capped, a transient Accept error
+// does not permanently kill a listener, and a cancelled context tears down
+// in-flight relays before Serve returns. An optional idle timeout (off by
+// default, like ssh -L and socat) can reclaim relays idle in both directions.
 package forward
 
 import (
@@ -23,12 +23,15 @@ import (
 	"time"
 )
 
-// options bounds a Serve run. It is unexported and carries internal defaults so
-// the public API stays unchanged; tests construct it directly with smaller
-// timeouts. Any non-positive field is filled from defaultOptions in serve.
+// options bounds a Serve run. It is unexported and carries internal defaults;
+// callers tune it through Option funcs and tests construct it directly. The
+// always-on bounds (dialTimeout, maxConns, acceptBackoff) are filled from
+// defaultOptions in serve when left non-positive. idleTimeout is special: it is
+// off by default and a non-positive value means "never reap", so it is not
+// defaulted.
 type options struct {
 	dialTimeout   time.Duration // cap on reaching a relay destination
-	idleTimeout   time.Duration // reclaim a relay idle in both directions this long
+	idleTimeout   time.Duration // reclaim a relay idle in both directions this long; <=0 disables
 	maxConns      int           // max concurrent relays per Serve call
 	acceptBackoff time.Duration // pause after a transient Accept error before retrying
 }
@@ -36,10 +39,22 @@ type options struct {
 func defaultOptions() options {
 	return options{
 		dialTimeout:   10 * time.Second,
-		idleTimeout:   90 * time.Second,
+		idleTimeout:   0, // off by default: do not reap idle relays (matches ssh -L/socat)
 		maxConns:      4096,
 		acceptBackoff: 50 * time.Millisecond,
 	}
+}
+
+// Option configures a Serve run without changing how existing callers invoke it.
+type Option func(*options)
+
+// WithIdleTimeout reclaims any relay idle in both directions for d. A
+// non-positive d disables idle reaping (the default), so long-lived but quiet
+// connections (an interactive SSH session, an idle database pool) are not torn
+// down underneath the user. TCP keepalive does not count as activity here: only
+// relayed application bytes reset the timer.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(o *options) { o.idleTimeout = d }
 }
 
 // Rule is a single forward: listen on Listen and relay to Dest.
@@ -81,13 +96,18 @@ func Listen(rules []Rule) ([]*Listener, error) {
 // Serve accepts connections on every listener and relays them to their
 // destinations until ctx is cancelled. logf, if non-nil, receives non-fatal
 // per-connection and per-listener events (an unreachable destination, a relay
-// reclaimed for being idle, or a transient accept error).
+// reclaimed for being idle, or a transient accept error). opts tune the run;
+// see WithIdleTimeout.
 //
-// Serve bounds concurrent relays, reclaims relays that go idle in both
-// directions, keeps serving across transient Accept errors, and on cancellation
-// closes the listeners and drains in-flight relays before returning.
-func Serve(ctx context.Context, listeners []*Listener, logf func(string, ...any)) {
-	serve(ctx, listeners, defaultOptions(), logf)
+// Serve bounds concurrent relays, keeps serving across transient Accept errors,
+// and on cancellation closes the listeners and drains in-flight relays before
+// returning. Idle reaping is off unless enabled via WithIdleTimeout.
+func Serve(ctx context.Context, listeners []*Listener, logf func(string, ...any), opts ...Option) {
+	o := defaultOptions()
+	for _, fn := range opts {
+		fn(&o)
+	}
+	serve(ctx, listeners, o, logf)
 }
 
 func serve(ctx context.Context, listeners []*Listener, opts options, logf func(string, ...any)) {
@@ -95,9 +115,7 @@ func serve(ctx context.Context, listeners []*Listener, opts options, logf func(s
 	if opts.dialTimeout <= 0 {
 		opts.dialTimeout = def.dialTimeout
 	}
-	if opts.idleTimeout <= 0 {
-		opts.idleTimeout = def.idleTimeout
-	}
+	// idleTimeout is intentionally not defaulted: <=0 means "never reap".
 	if opts.maxConns <= 0 {
 		opts.maxConns = def.maxConns
 	}
@@ -186,10 +204,12 @@ func relay(ctx context.Context, src net.Conn, dest string, opts options, logf fu
 
 	// lastActive holds the unix-nano time of the most recent byte seen in either
 	// direction. The watchdog goroutine closes both connections when ctx is
-	// cancelled (prompt shutdown) or when the relay has been idle in both
-	// directions for idleTimeout (reclaiming slowloris-style holds). Closing the
-	// conns unblocks the copy loops below; the watchdog itself stops when the
-	// relay finishes, signalled by closing done.
+	// cancelled (prompt shutdown) or, when an idle timeout is configured, when
+	// the relay has been idle in both directions for idleTimeout (reclaiming
+	// slowloris-style holds). Closing the conns unblocks the copy loops below;
+	// the watchdog itself stops when the relay finishes, signalled by closing
+	// done. The watchdog runs even with idle reaping off, because shutdown drain
+	// relies on it to tear the conns down on cancellation.
 	var lastActive atomic.Int64
 	lastActive.Store(time.Now().UnixNano())
 	touch := func() { lastActive.Store(time.Now().UnixNano()) }
@@ -197,8 +217,18 @@ func relay(ctx context.Context, src net.Conn, dest string, opts options, logf fu
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		ticker := time.NewTicker(opts.idleTimeout / 2)
-		defer ticker.Stop()
+		// idleC stays nil when idle reaping is off; a receive on a nil channel
+		// blocks forever, so the watchdog then only services ctx and done.
+		var idleC <-chan time.Time
+		if opts.idleTimeout > 0 {
+			interval := opts.idleTimeout / 2
+			if interval <= 0 {
+				interval = opts.idleTimeout
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			idleC = ticker.C
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -207,7 +237,7 @@ func relay(ctx context.Context, src net.Conn, dest string, opts options, logf fu
 				return
 			case <-done:
 				return
-			case now := <-ticker.C:
+			case now := <-idleC:
 				if idle := now.Sub(time.Unix(0, lastActive.Load())); idle >= opts.idleTimeout {
 					if logf != nil {
 						logf("idle relay %s -> %s closed after %s", src.RemoteAddr(), dest, idle.Round(time.Second))

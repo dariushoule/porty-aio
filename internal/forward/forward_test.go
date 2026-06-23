@@ -452,3 +452,109 @@ func TestForwardShutdownDrainsActiveRelay(t *testing.T) {
 		t.Error("expected our connection to be closed on shutdown")
 	}
 }
+
+// TestDefaultIdleReapIsOff pins the default: idle reaping must be off unless a
+// caller opts in with WithIdleTimeout, so the forwarder does not tear down
+// long-lived but quiet connections (the ssh -L/socat behavior).
+func TestDefaultIdleReapIsOff(t *testing.T) {
+	if d := defaultOptions().idleTimeout; d > 0 {
+		t.Fatalf("default idleTimeout = %s, want <=0 (idle reaping off by default)", d)
+	}
+	opts := defaultOptions()
+	WithIdleTimeout(45 * time.Second)(&opts)
+	if opts.idleTimeout != 45*time.Second {
+		t.Fatalf("WithIdleTimeout did not apply: got %s", opts.idleTimeout)
+	}
+}
+
+// TestForwardIdleReapDisabledKeepsHealthyConn confirms the regression we found:
+// with idle reaping off, a connection that is alive but idle at the application
+// level (an SSH session at a prompt) is not reaped. A healthy echo backend
+// stands in for the server; the client goes idle, then its next request must
+// still be relayed.
+func TestForwardIdleReapDisabledKeepsHealthyConn(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			c, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { io.Copy(c, c); c.Close() }(c) // echo
+		}
+	}()
+
+	ls, err := Listen([]Rule{{Listen: "127.0.0.1:0", Dest: backend.Addr().String()}})
+	if err != nil {
+		t.Fatalf("forward listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go serve(ctx, ls, options{}, nil) // idleTimeout zero: reaping off
+
+	conn, err := net.Dial("tcp", ls[0].Addr().String())
+	if err != nil {
+		t.Fatalf("dial forward: %v", err)
+	}
+	defer conn.Close()
+
+	exchange := func(msg string) (string, error) {
+		conn.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			return "", err
+		}
+		buf := make([]byte, 64)
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := conn.Read(buf)
+		return string(buf[:n]), err
+	}
+
+	if got, err := exchange("hello\n"); err != nil || got != "hello\n" {
+		t.Fatalf("initial echo failed: got %q err=%v", got, err)
+	}
+	time.Sleep(600 * time.Millisecond) // idle, like a user at the prompt
+	if got, err := exchange("still there?\n"); err != nil {
+		t.Fatalf("idle relay was reaped with reaping off: %v", err)
+	} else if got != "still there?\n" {
+		t.Fatalf("post-idle echo = %q, want %q", got, "still there?\n")
+	}
+}
+
+// TestForwardShutdownDrainsWithIdleOff confirms graceful drain still works when
+// idle reaping is off: the per-relay watchdog must run for ctx teardown even
+// without an idle ticker, or cancellation would hang on a quiet relay.
+func TestForwardShutdownDrainsWithIdleOff(t *testing.T) {
+	backend := holdBackend(t)
+
+	ls, err := Listen([]Rule{{Listen: "127.0.0.1:0", Dest: backend.Addr().String()}})
+	if err != nil {
+		t.Fatalf("forward listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan struct{})
+	go func() {
+		serve(ctx, ls, options{}, nil) // idle off
+		close(served)
+	}()
+
+	conn, err := net.Dial("tcp", ls[0].Addr().String())
+	if err != nil {
+		t.Fatalf("dial forward: %v", err)
+	}
+	defer conn.Close()
+	conn.Write([]byte("active"))
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return within 3s of cancellation with idle reaping off")
+	}
+}
