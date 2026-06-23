@@ -131,6 +131,7 @@ func runForward(args []string) {
 	var listen, to multiFlag
 	fs.Var(&listen, "listen", "address to listen on (repeatable): ':8080' or '127.0.0.1:8080'")
 	fs.Var(&to, "to", "destination to relay to (repeatable): '10.0.0.5:80' or '127.0.0.1:3306'")
+	idleTimeout := fs.Duration("idle-timeout", 0, "reclaim relays idle in both directions this long (0 = never, like ssh -L/socat)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "porty-aio forward (single-box TCP port forwarder)\n\n")
 		fmt.Fprintf(os.Stderr, "usage: porty-aio forward --listen <addr> --to <host:port> [--listen ... --to ...]\n\n")
@@ -169,5 +170,5 @@ func runForward(args []string) {
 	logf := func(format string, a ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", a...)
 	}
-	forward.Serve(ctx, listeners, logf)
+	forward.Serve(ctx, listeners, logf, forward.WithIdleTimeout(*idleTimeout))
 }

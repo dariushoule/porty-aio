@@ -56,6 +56,17 @@ porty-aio forward --listen :8080 --to 10.0.0.5:80 --listen :2222 --to 10.0.0.9:2
 `--listen` binds all interfaces when the host is omitted (`:8080`); give a host
 to bind one interface (`127.0.0.1:8080`). TCP only.
 
+The relay bounds its own resources so an exposed listener is not trivially
+exhausted: concurrent relays are capped, a transient accept error (such as a
+momentary file-descriptor shortage) does not permanently kill the listener, and
+Ctrl-C drains in-flight relays before exit.
+
+By default a relay is never reaped for being idle, so long-lived but quiet
+connections (an interactive SSH session, an idle database pool) stay up, the same
+as `ssh -L` or socat. Pass `--idle-timeout` to opt in to reclaiming relays that
+go idle in both directions, for example `--idle-timeout 90s`. Only relayed
+application bytes count as activity; TCP keepalive does not.
+
 ## Build (Dockerized, no local Go toolchain needed)
 
 You only need Docker. The Go version is pinned in the `Dockerfile`. Bump that one
